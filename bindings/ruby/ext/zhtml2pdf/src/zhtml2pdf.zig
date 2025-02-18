@@ -54,8 +54,8 @@ pub const __builtin_assume = @import("std").zig.c_builtins.__builtin_assume;
 pub const __builtin_unreachable = @import("std").zig.c_builtins.__builtin_unreachable;
 pub const __builtin_constant_p = @import("std").zig.c_builtins.__builtin_constant_p;
 pub const __builtin_mul_overflow = @import("std").zig.c_builtins.__builtin_mul_overflow;
-pub extern fn init_zhtml2pdf(...) void;
-pub extern fn deinit_zhtml2pdf(...) void;
+pub extern fn init_zhtml2pdf(...) c_int;
+
 pub extern fn zhtml2pdf(
     input: [*c]const u8,
     settings: [*c]const u8,
@@ -63,8 +63,7 @@ pub extern fn zhtml2pdf(
     output: *[*c]u8,
 ) c_int;
 pub extern fn zhtml2pdf_free(buffer: *anyopaque) void;
-pub extern fn init_loop_zhtml2pdf(...) void;
-pub extern fn deinit_loop_zhtml2pdf(...) void;
+pub extern fn deinit_zhtml2pdf(...) c_int;
 pub const __llvm__ = @as(c_int, 1);
 pub const __clang__ = @as(c_int, 1);
 pub const __clang_major__ = @as(c_int, 18);

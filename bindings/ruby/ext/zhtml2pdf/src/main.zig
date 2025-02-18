@@ -7,13 +7,27 @@ fn rb_converter_init(...) callconv(.C) ruby.VALUE {
     var ap: std.builtin.VaList = @cVaStart();
     defer @cVaEnd(&ap);
 
-    zhtml2pdf.init_zhtml2pdf();
+    const result = zhtml2pdf.init_zhtml2pdf();
+
+    if (result != 0 and result != -1) {
+        const exception: ruby.VALUE = ruby.rb_exc_new2(
+            ruby.rb_eRuntimeError,
+            "Failed to init zhtml2pdf",
+        );
+        ruby.rb_exc_raise(exception);
+    }
 
     return @cVaArg(&ap, ruby.VALUE);
 }
 
-fn rb_converter_finalize(_: ruby.VALUE, _: ruby.VALUE, _: c_int, _: [*c]const ruby.VALUE, _: ruby.VALUE) callconv(.C) ruby.VALUE {
-    zhtml2pdf.deinit_zhtml2pdf();
+fn rb_converter_finalize(
+    _: ruby.VALUE,
+    _: ruby.VALUE,
+    _: c_int,
+    _: [*c]const ruby.VALUE,
+    _: ruby.VALUE,
+) callconv(.C) ruby.VALUE {
+    _ = zhtml2pdf.deinit_zhtml2pdf();
     return ruby.Qnil;
 }
 
@@ -42,14 +56,19 @@ fn rb_converter_convert(...) callconv(.C) ruby.VALUE {
 
     const rstring: ruby.VALUE = ruby.rb_str_new(content, size);
 
-    zhtml2pdf.zhtml2pdf_free(@ptrCast(&content));
+    zhtml2pdf.zhtml2pdf_free(content);
+    content = undefined;
 
     return rstring;
 }
 
 export fn Init_zhtml2pdf() void {
     const zhtml2pdf_mod: ruby.VALUE = ruby.rb_define_module("ZHtml2Pdf");
-    const converter_klass: ruby.VALUE = ruby.rb_define_class_under(zhtml2pdf_mod, "Converter", ruby.rb_cObject);
+    const converter_klass: ruby.VALUE = ruby.rb_define_class_under(
+        zhtml2pdf_mod,
+        "Converter",
+        ruby.rb_cObject,
+    );
 
     _ = ruby.rb_define_method(converter_klass, "convert", rb_converter_convert, 3);
     _ = ruby.rb_define_method(converter_klass, "initialize", rb_converter_init, 0);

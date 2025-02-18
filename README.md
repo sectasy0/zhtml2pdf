@@ -53,6 +53,8 @@ int main() {
     // Do whatever you want with pdf, output is in base64
 
     zhtml2pdf_free(pdf_data);
+    *pdf_data = NULL;
+
     deinit_zhtml2pdf();
 
     return 0;

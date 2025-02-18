@@ -1,14 +1,17 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <webkit2/webkit2.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
+#include <limits.h>
 
 #include "zhtml2pdf.h"
 
-static int nonthreaded_init = 0;
+static GThread* loop_thread = 0;
+static GMainLoop* loop = 0;
 
-static GThread *loop_thread = 0;
-static GMainLoop *loop = 0;
-
+static pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int loop_initialized = 0;
 
 struct ZHTML2PDF_CONTEXT {
     GtkPrintSettings *settings;
@@ -22,8 +25,8 @@ struct html2pdf_params {
     const char *settings;
     const char *css;
 
-    GCond *wait_cond;
-    GMutex *wait_mutex;
+    pthread_cond_t *wait_cond;
+    pthread_mutex_t *wait_mutex;
     int *wait_data;
 };
 
@@ -33,50 +36,84 @@ static int _html2pdf(struct html2pdf_params* params);
 static void* _event_loop_function(void* data);
 static int _read_file_contents(const char* filename, unsigned char** output);
 void _encode_base64(const unsigned char* input, size_t length, unsigned char* output);
+char* create_file_path(char** printer_filename);
 
+int init_zhtml2pdf() {
+    pthread_mutex_lock(&init_mutex);
 
-void init_zhtml2pdf() {
-    gtk_init_check(NULL, NULL);
-    nonthreaded_init = 1;
-}
+    if (atomic_load(&loop_initialized)) {
+        pthread_mutex_unlock(&init_mutex);
+        return -1;
+    }
 
-void deinit_zhtml2pdf() {
-    gtk_init_check(NULL, NULL);
-}
-
-void init_loop_zhtml2pdf() {
-    if (loop_thread != NULL) return;
     struct timespec ts;
     ts.tv_sec = 0;
     ts.tv_nsec = 1000000;
 
     loop_thread = g_thread_new("zhtml2pdf_event_loop", _event_loop_function, NULL);
+    if (!loop_thread) {
+        pthread_mutex_unlock(&init_mutex);
+        return -2;
+    }
 
-    while (loop == NULL) nanosleep(&ts, NULL);
+    while(!atomic_load(&loop_initialized)) {
+        nanosleep(&ts, NULL);
+    }
 
-    while (!g_main_loop_is_running(loop)) nanosleep(&ts, NULL);
+    while (!g_main_loop_is_running(loop)) {
+        nanosleep(&ts, NULL);
+    }
+
+    pthread_mutex_unlock(&init_mutex);
+    return 0;
 }
 
-void deinit_loop_zhtml2pdf() {
-    g_main_loop_quit(loop);
-    g_thread_join(loop_thread);
-    g_main_loop_unref(loop);
+int deinit_zhtml2pdf() {
+    pthread_mutex_lock(&init_mutex);
+
+    if (!atomic_load(&loop_initialized)) {
+        pthread_mutex_unlock(&init_mutex);
+        return -1;
+    }
+
+    if (loop && g_main_loop_is_running(loop)) {
+        g_main_loop_quit(loop);
+    }
+
+    if (loop_thread) {
+        g_thread_join(loop_thread);
+        loop_thread = 0;
+    }
+
+    if (loop) {
+        g_main_loop_unref(loop);
+        loop = 0;
+    }
+
+    atomic_store(&loop_initialized, 0);
+    pthread_mutex_unlock(&init_mutex);
+    return 0;
 }
 
-void zhtml2pdf_free(void** buffer) {
-    if (buffer != NULL || *buffer != NULL) {
-        free(*buffer);
-        *buffer = NULL;
+void zhtml2pdf_free(void* buffer) {
+    if (buffer != NULL) {
+        free(buffer);
     }
 }
 
-
 int zhtml2pdf(const char* input, const char* settings, const char* css, unsigned char** output) {
+    if (!atomic_load(&loop_initialized)) {
+        return -1; // loop not initialized, will not print nothing.
+    }
+
     struct html2pdf_params *params = malloc(sizeof(struct html2pdf_params));
-    if (params == NULL) return -1;
+    if (params == NULL) return -2;
+
+    char* printer_filename = NULL;
+    const char* output_path = create_file_path(&printer_filename);
 
     params->input = input;
-    params->output = "file:///tmp/zhtml2pdf_tempfile";
+    params->output = printer_filename;
     params->settings = settings;
     params->css = css;
 
@@ -84,13 +121,13 @@ int zhtml2pdf(const char* input, const char* settings, const char* css, unsigned
     params->wait_cond = NULL;
     params->wait_data = NULL;
 
-    if (!nonthreaded_init && g_main_context_default() != NULL) {
-        GMutex wait_mutex;
-        GCond wait_cond;
+    if ((g_main_context_get_thread_default() == NULL || g_main_depth() == 0) && g_main_context_default() != NULL) {
+        pthread_mutex_t wait_mutex;
+        pthread_cond_t wait_cond;
         int wait_data = 0;
 
-        g_mutex_init(&wait_mutex);
-        g_cond_init(&wait_cond);
+        pthread_mutex_init(&wait_mutex, NULL);
+        pthread_cond_init(&wait_cond, NULL);
 
         params->wait_cond = &wait_cond;
         params->wait_mutex = &wait_mutex;
@@ -98,31 +135,39 @@ int zhtml2pdf(const char* input, const char* settings, const char* css, unsigned
 
         g_idle_add((GSourceFunc)_html2pdf, params);
 
-        g_mutex_lock(&wait_mutex);
+        pthread_mutex_lock(&wait_mutex);
         while (wait_data == 0) {
-            g_cond_wait(&wait_cond, &wait_mutex);
+            pthread_cond_wait(&wait_cond, &wait_mutex);
         }
+        pthread_mutex_unlock(&wait_mutex);
 
-        g_mutex_unlock(&wait_mutex);
+        pthread_mutex_destroy(&wait_mutex);
+        pthread_cond_destroy(&wait_cond);
 
-        g_mutex_clear(&wait_mutex);
-        g_cond_clear(&wait_cond);
-        free(params);
+    } else {
+        params->wait_mutex = NULL;
+        params->wait_cond = NULL;
+        params->wait_data = NULL;
 
-        return -2;
+        _html2pdf(params);
     }
 
-    _html2pdf(params);
+    int pdf_size = _read_file_contents(output_path, output);
+
+    remove(output_path);
     free(params);
 
-    return _read_file_contents("/tmp/zhtml2pdf_tempfile", output);
+    return pdf_size;
 }
 
 static void* _event_loop_function(void* data) {
-    gtk_init_check (NULL,  NULL);
+    gtk_init_check(NULL,  NULL);
     loop = g_main_loop_new(NULL,false);
 
+    atomic_store(&loop_initialized, 1);
+
     g_main_loop_run(loop);
+    return NULL;
 }
 
 static void _web_view_load_changed(WebKitWebView* web_view, WebKitLoadEvent load_event, void* user_data) {
@@ -209,36 +254,48 @@ static int _html2pdf(struct html2pdf_params* params) {
     g_main_loop_unref(loop);
 
     if (params->wait_mutex && params->wait_cond && params->wait_data) {
-        g_mutex_lock(params->wait_mutex);
+        pthread_mutex_lock(params->wait_mutex);
         (*params->wait_data)++;
-        g_cond_signal(params->wait_cond);
-        g_mutex_unlock(params->wait_mutex);
+        pthread_cond_signal(params->wait_cond);
+        pthread_mutex_unlock(params->wait_mutex);
     }
 
     return G_SOURCE_REMOVE;
 }
 
+char* create_file_path(char** printer_filename) {
+    static char filename[43]; static char pfilename[50];
+
+    unsigned long thread_id = (unsigned long)pthread_self();
+
+    snprintf(filename, sizeof(filename), "/tmp/zhtml2pdf_tempfile_%lu", thread_id);
+    snprintf(pfilename, sizeof(pfilename), "file://%s", filename);
+
+    *printer_filename = pfilename;
+
+    return filename;
+}
+
 static int _read_file_contents(const char* filename, unsigned char** output) {
     struct stat st;
-
-    if (stat(filename, &st) == -1) return -1;
+    if (stat(filename, &st) == -1) return -10;
 
     size_t file_size = st.st_size;
 
     FILE *file_pointer = fopen(filename, "rb");
-    if (!file_pointer) return -2;
+    if (!file_pointer) return -3;
 
     unsigned char *file_content = malloc(file_size);
     if (!file_content) {
         fclose(file_pointer);
-        return -3;
+        return -4;
     }
 
     size_t bytes_read = fread(file_content, 1, file_size, file_pointer);
     if (bytes_read != file_size) {
         free(file_content);
         fclose(file_pointer);
-        return -4;
+        return -5;
     }
 
     int encoded_size = ((file_size + 2) / 3) * 4;
@@ -246,7 +303,7 @@ static int _read_file_contents(const char* filename, unsigned char** output) {
     if (!encoded) {
         free(file_content);
         fclose(file_pointer);
-        return -5;
+        return -6;
     }
 
     _encode_base64(file_content, file_size, encoded);
