@@ -7,6 +7,8 @@
 
 #include "zhtml2pdf.h"
 
+#define LOOP_INIT_TIMEOUT 15
+
 static GThread* loop_thread = 0;
 static GMainLoop* loop = 0;
 
@@ -46,9 +48,7 @@ int init_zhtml2pdf() {
         return -1;
     }
 
-    struct timespec ts;
-    ts.tv_sec = 0;
-    ts.tv_nsec = 1000000;
+    struct timespec ts = {0, 1000000};
 
     loop_thread = g_thread_new("zhtml2pdf_event_loop", _event_loop_function, NULL);
     if (!loop_thread) {
@@ -56,12 +56,31 @@ int init_zhtml2pdf() {
         return -2;
     }
 
+    time_t start_time = time(NULL);
+    const int timeout = LOOP_INIT_TIMEOUT;
+
     while(!atomic_load(&loop_initialized)) {
         nanosleep(&ts, NULL);
+
+        if (atomic_load(&loop_initialized) < 0) {
+            pthread_mutex_unlock(&init_mutex);
+            return -3;
+        }
+
+        if (time(NULL) - start_time > timeout) {
+            pthread_mutex_unlock(&init_mutex);
+            return -4;
+        }
     }
 
+    start_time = time(NULL);
     while (!g_main_loop_is_running(loop)) {
         nanosleep(&ts, NULL);
+
+        if (time(NULL) - start_time > timeout) {
+            pthread_mutex_unlock(&init_mutex);
+            return -5;
+        }
     }
 
     pthread_mutex_unlock(&init_mutex);
@@ -102,11 +121,13 @@ void zhtml2pdf_free(void* buffer) {
 }
 
 int zhtml2pdf(const char* input, const char* settings, const char* css, unsigned char** output) {
-    if (!atomic_load(&loop_initialized)) {
-        return -1; // loop not initialized, will not print nothing.
+    if (!atomic_load(&loop_initialized) || !input || !output) {
+        // loop not initialized, will not print nothing.
+        // input and output can't be null
+        return -1;
     }
 
-    struct html2pdf_params *params = malloc(sizeof(struct html2pdf_params));
+    struct html2pdf_params* params = malloc(sizeof(struct html2pdf_params));
     if (params == NULL) return -2;
 
     char* printer_filename = NULL;
@@ -161,8 +182,12 @@ int zhtml2pdf(const char* input, const char* settings, const char* css, unsigned
 }
 
 static void* _event_loop_function(void* data) {
-    gtk_init_check(NULL,  NULL);
-    loop = g_main_loop_new(NULL,false);
+    if (!gtk_init_check(NULL, NULL)) {
+        atomic_store(&loop_initialized, -1);
+        return NULL;
+    }
+
+    loop = g_main_loop_new(NULL, false);
 
     atomic_store(&loop_initialized, 1);
 
@@ -241,6 +266,11 @@ static int _html2pdf(struct html2pdf_params* params) {
 
     g_signal_connect(web_view, "load-changed", (void (*)(void))_web_view_load_changed, &context);
 
+    if (!params->input) {
+        g_main_loop_quit(context.loop);
+        return G_SOURCE_REMOVE;
+    }
+
     webkit_web_view_load_uri(web_view, params->input);
 
     g_main_loop_run(loop);
@@ -290,6 +320,8 @@ static int _read_file_contents(const char* filename, unsigned char** output) {
         fclose(file_pointer);
         return -4;
     }
+
+    memset(file_content, 0, file_size);
 
     size_t bytes_read = fread(file_content, 1, file_size, file_pointer);
     if (bytes_read != file_size) {
